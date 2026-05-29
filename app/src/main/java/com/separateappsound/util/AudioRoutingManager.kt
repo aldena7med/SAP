@@ -2,8 +2,12 @@ package com.separateappsound.util
 
 import android.content.Context
 import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
+import android.media.audiopolicy.AudioMix
+import android.media.audiopolicy.AudioMixingRule
+import android.media.audiopolicy.AudioPolicy
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -17,6 +21,7 @@ class AudioRoutingManager(private val context: Context) {
     private val repository = RouteRepository(context)
     private val deviceManager = BluetoothDeviceManager(context)
     private val handler = Handler(Looper.getMainLooper())
+    private var activeAudioPolicy: AudioPolicy? = null
 
     companion object {
         const val TAG = "AudioRoutingManager"
@@ -29,13 +34,24 @@ class AudioRoutingManager(private val context: Context) {
     }
 
     fun startMonitoring() {
+        grantRoutingPermissionViaRoot()
         audioManager.registerAudioPlaybackCallback(playbackCallback, handler)
         Log.d(TAG, "Started monitoring audio playback")
     }
 
     fun stopMonitoring() {
         audioManager.unregisterAudioPlaybackCallback(playbackCallback)
+        releaseAudioPolicy()
         Log.d(TAG, "Stopped monitoring audio playback")
+    }
+
+    private fun grantRoutingPermissionViaRoot() {
+        runAsRoot(listOf(
+            "appops set com.separateappsound MODIFY_AUDIO_ROUTING allow",
+            "pm grant --user 0 com.separateappsound android.permission.MODIFY_AUDIO_ROUTING",
+            "pm grant com.separateappsound android.permission.MODIFY_AUDIO_ROUTING",
+            "cmd appops set com.separateappsound MODIFY_AUDIO_ROUTING 0"
+        ))
     }
 
     private fun handlePlaybackChanged(configs: List<AudioPlaybackConfiguration>) {
@@ -45,67 +61,100 @@ class AudioRoutingManager(private val context: Context) {
             val uid = getUidFromConfig(config)
             val packageName = getPackageNameForUid(uid) ?: continue
             val matchingRoute = activeRoutes.firstOrNull { it.packageName == packageName }
-            if (matchingRoute != null) {
-                applyRouting(matchingRoute)
-            }
+            if (matchingRoute != null) applyRouting(matchingRoute)
         }
     }
 
     fun applyRouting(route: AppRoute) {
         Log.d(TAG, "Applying routing: ${route.appName} -> ${route.deviceName}")
+        val policySuccess = tryAudioPolicyRouting(route)
+        if (policySuccess) return
+        tryRootUidRouting(route)
+    }
 
-        // Try root-based routing first (works on KernelSU/Magisk without MODIFY_AUDIO_ROUTING)
-        val rootSuccess = tryRootRouting(route)
-
-        if (!rootSuccess) {
-            // Fallback to communication device API
+    private fun tryAudioPolicyRouting(route: AppRoute): Boolean {
+        return try {
+            releaseAudioPolicy()
+            val uid = getUidForPackage(route.packageName) ?: return false
             val targetDevice = deviceManager.getAudioDeviceInfoForAddress(route.deviceAddress)
                 ?: if (route.deviceAddress == AppRoute.PHONE_SPEAKER_ADDRESS)
                     BluetoothDeviceManager.getPhoneSpeakerDeviceInfo(audioManager)
-                else null
-            targetDevice?.let {
-                try { audioManager.setCommunicationDevice(it) } catch (e: Exception) {
-                    Log.e(TAG, "setCommunicationDevice failed", e)
-                }
+                else return false
+
+            val mixingRule = AudioMixingRule.Builder()
+                .addMixRule(AudioMixingRule.RULE_MATCH_UID, uid)
+                .build()
+
+            val audioFormat = AudioFormat.Builder()
+                .setSampleRate(48000)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                .build()
+
+            val audioMix = AudioMix.Builder(mixingRule)
+                .setFormat(audioFormat)
+                .setRouteFlags(AudioMix.ROUTE_FLAG_RENDER)
+                .build()
+
+            val policy = AudioPolicy.Builder(context)
+                .addMix(audioMix)
+                .build()
+
+            val result = audioManager.registerAudioPolicy(policy)
+            if (result == AudioManager.SUCCESS) {
+                policy.setPreferredDeviceForRule(
+                    AudioMixingRule.Builder()
+                        .addMixRule(AudioMixingRule.RULE_MATCH_UID, uid)
+                        .build(),
+                    targetDevice
+                )
+                activeAudioPolicy = policy
+                true
+            } else {
+                Log.w(TAG, "registerAudioPolicy failed: $result")
+                false
             }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Needs MODIFY_AUDIO_ROUTING: ${e.message}")
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "AudioPolicy error", e)
+            false
         }
     }
 
-    private fun tryRootRouting(route: AppRoute): Boolean {
+    private fun tryRootUidRouting(route: AppRoute): Boolean {
         return try {
             val uid = getUidForPackage(route.packageName) ?: return false
-
-            if (route.deviceAddress == AppRoute.PHONE_SPEAKER_ADDRESS) {
-                // Route this app back to speaker - clear any override
-                runAsRoot(listOf(
-                    "cmd appops set --uid $uid PLAY_AUDIO allow",
-                    "cmd audio set-preferred-device-for-strategy 0 0"  // strategy 0 = media
-                ))
+            val deviceId = if (route.deviceAddress == AppRoute.PHONE_SPEAKER_ADDRESS) {
+                BluetoothDeviceManager.getPhoneSpeakerDeviceInfo(audioManager)?.id ?: return false
             } else {
-                // Get the audio device ID for the bluetooth address
-                val btDeviceId = getAudioDeviceIdForAddress(route.deviceAddress)
-
-                if (btDeviceId != null) {
-                    // Use cmd audio to set preferred device for this app's UID
-                    runAsRoot(listOf(
-                        // Grant the routing permission to our app via root
-                        "pm grant com.separateappsound android.permission.MODIFY_AUDIO_ROUTING",
-                        // Set preferred device for media strategy
-                        "cmd audio set-preferred-device-for-strategy 0 $btDeviceId"
-                    ))
-                } else {
-                    // Fallback: force bluetooth A2DP output
-                    runAsRoot(listOf(
-                        "pm grant com.separateappsound android.permission.MODIFY_AUDIO_ROUTING",
-                        "cmd bluetooth_manager enable"
-                    ))
-                    false
-                }
+                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                    .firstOrNull { it.address.equals(route.deviceAddress, ignoreCase = true) }
+                    ?.id ?: return false
             }
-            true
+            runAsRoot(listOf("cmd audio set-preferred-device-for-uid $uid $deviceId"))
         } catch (e: Exception) {
-            Log.e(TAG, "Root routing failed", e)
+            Log.e(TAG, "Root UID routing failed", e)
             false
+        }
+    }
+
+    private fun releaseAudioPolicy() {
+        activeAudioPolicy?.let {
+            try { audioManager.unregisterAudioPolicy(it) } catch (e: Exception) { }
+            activeAudioPolicy = null
+        }
+    }
+
+    fun removeRouting(route: AppRoute) {
+        releaseAudioPolicy()
+        try {
+            val uid = getUidForPackage(route.packageName)
+            if (uid != null) runAsRoot(listOf("cmd audio remove-preferred-device-for-uid $uid"))
+            audioManager.clearCommunicationDevice()
+        } catch (e: Exception) {
+            Log.e(TAG, "removeRouting failed", e)
         }
     }
 
@@ -113,17 +162,11 @@ class AudioRoutingManager(private val context: Context) {
         return try {
             val process = Runtime.getRuntime().exec("su")
             val os = process.outputStream.bufferedWriter()
-            for (cmd in commands) {
-                os.write(cmd)
-                os.newLine()
-            }
-            os.write("exit")
-            os.newLine()
-            os.flush()
-            os.close()
+            for (cmd in commands) { os.write(cmd); os.newLine() }
+            os.write("exit"); os.newLine(); os.flush(); os.close()
             val exitCode = process.waitFor()
             val errors = BufferedReader(InputStreamReader(process.errorStream)).readText()
-            if (errors.isNotBlank()) Log.w(TAG, "Root cmd stderr: $errors")
+            if (errors.isNotBlank()) Log.w(TAG, "Root stderr: $errors")
             exitCode == 0
         } catch (e: Exception) {
             Log.e(TAG, "runAsRoot failed", e)
@@ -131,49 +174,28 @@ class AudioRoutingManager(private val context: Context) {
         }
     }
 
-    private fun getAudioDeviceIdForAddress(address: String): Int? {
-        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            .firstOrNull { it.address.equals(address, ignoreCase = true) }
-            ?.id
-    }
-
-    fun removeRouting(route: AppRoute) {
-        Log.d(TAG, "Removing routing for ${route.appName}")
-        try {
-            runAsRoot(listOf("cmd audio set-preferred-device-for-strategy 0 0"))
-            audioManager.clearCommunicationDevice()
-        } catch (e: Exception) {
-            Log.e(TAG, "removeRouting failed", e)
-        }
-    }
-
     private fun getUidForPackage(packageName: String): Int? {
-        return try {
-            context.packageManager.getApplicationInfo(packageName, 0).uid
-        } catch (e: Exception) { null }
+        return try { context.packageManager.getApplicationInfo(packageName, 0).uid }
+        catch (e: Exception) { null }
     }
 
     private fun getUidFromConfig(config: AudioPlaybackConfiguration): Int {
-        return try {
-            config.javaClass.getMethod("getClientUid").invoke(config) as? Int ?: -1
-        } catch (e: Exception) {
-            try {
-                config.javaClass.getMethod("getClientPid").invoke(config) as? Int ?: -1
-            } catch (e2: Exception) { -1 }
+        return try { config.javaClass.getMethod("getClientUid").invoke(config) as? Int ?: -1 }
+        catch (e: Exception) {
+            try { config.javaClass.getMethod("getClientPid").invoke(config) as? Int ?: -1 }
+            catch (e2: Exception) { -1 }
         }
     }
 
     private fun getPackageNameForUid(uid: Int): String? {
         if (uid < 0) return null
-        return try {
-            context.packageManager.getPackagesForUid(uid)?.firstOrNull()
-        } catch (e: Exception) { null }
+        return try { context.packageManager.getPackagesForUid(uid)?.firstOrNull() }
+        catch (e: Exception) { null }
     }
 
     fun getActivePlayingPackages(): List<String> {
         return audioManager.activePlaybackConfigurations
-            .mapNotNull { getPackageNameForUid(getUidFromConfig(it)) }
-            .distinct()
+            .mapNotNull { getPackageNameForUid(getUidFromConfig(it)) }.distinct()
     }
 
     fun hasRootAccess(): Boolean {
