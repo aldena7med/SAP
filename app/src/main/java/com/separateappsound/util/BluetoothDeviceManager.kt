@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
@@ -20,7 +21,6 @@ class BluetoothDeviceManager(private val context: Context) {
     fun getAvailableDevices(): List<AudioDevice> {
         val devices = mutableListOf<AudioDevice>()
 
-        // Always add phone speaker first
         devices.add(
             AudioDevice(
                 address = AppRoute.PHONE_SPEAKER_ADDRESS,
@@ -30,12 +30,26 @@ class BluetoothDeviceManager(private val context: Context) {
             )
         )
 
-        // Add connected Bluetooth audio devices
         if (bluetoothAdapter != null && bluetoothAdapter.isEnabled) {
             try {
                 val bondedDevices: Set<BluetoothDevice> = bluetoothAdapter.bondedDevices ?: emptySet()
 
-                val connectedBtAddresses = audioManager
+                val connectedA2dp = try {
+                    bluetoothManager?.getConnectedDevices(BluetoothProfile.A2DP)
+                        ?.map { it.address.lowercase() }?.toSet() ?: emptySet()
+                } catch (e: Exception) { emptySet() }
+
+                val connectedHeadset = try {
+                    bluetoothManager?.getConnectedDevices(BluetoothProfile.HEADSET)
+                        ?.map { it.address.lowercase() }?.toSet() ?: emptySet()
+                } catch (e: Exception) { emptySet() }
+
+                val connectedHearingAid = try {
+                    bluetoothManager?.getConnectedDevices(BluetoothProfile.HEARING_AID)
+                        ?.map { it.address.lowercase() }?.toSet() ?: emptySet()
+                } catch (e: Exception) { emptySet() }
+
+                val audioOutputAddresses = audioManager
                     .getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                     .filter {
                         it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
@@ -47,12 +61,11 @@ class BluetoothDeviceManager(private val context: Context) {
                     .map { it.address.lowercase() }
                     .toSet()
 
+                val allConnectedAddresses = connectedA2dp + connectedHeadset + connectedHearingAid + audioOutputAddresses
+
                 for (device in bondedDevices) {
-                    // Include ALL paired devices - don't filter by Bluetooth class
-                    // Some speakers (e.g. LG) don't advertise AUDIO service class correctly
-                    val isConnected = connectedBtAddresses.any {
-                        it == device.address.lowercase()
-                    }
+                    val address = device.address.lowercase()
+                    val isConnected = allConnectedAddresses.contains(address)
                     devices.add(
                         AudioDevice(
                             address = device.address,
@@ -62,12 +75,9 @@ class BluetoothDeviceManager(private val context: Context) {
                         )
                     )
                 }
-            } catch (e: SecurityException) {
-                // Bluetooth permission not granted yet
-            }
+            } catch (e: SecurityException) { }
         }
 
-        // Add wired headphones if connected
         audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
             .filter {
                 it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
