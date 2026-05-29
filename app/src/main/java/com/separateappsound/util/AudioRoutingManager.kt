@@ -1,13 +1,9 @@
 package com.separateappsound.util
 
 import android.content.Context
-import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
-import android.media.audiopolicy.AudioMix
-import android.media.audiopolicy.AudioMixingRule
-import android.media.audiopolicy.AudioPolicy
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -21,7 +17,7 @@ class AudioRoutingManager(private val context: Context) {
     private val repository = RouteRepository(context)
     private val deviceManager = BluetoothDeviceManager(context)
     private val handler = Handler(Looper.getMainLooper())
-    private var activeAudioPolicy: AudioPolicy? = null
+    private var activeAudioPolicy: Any? = null
 
     companion object {
         const val TAG = "AudioRoutingManager"
@@ -36,13 +32,12 @@ class AudioRoutingManager(private val context: Context) {
     fun startMonitoring() {
         grantRoutingPermissionViaRoot()
         audioManager.registerAudioPlaybackCallback(playbackCallback, handler)
-        Log.d(TAG, "Started monitoring audio playback")
+        Log.d(TAG, "Started monitoring")
     }
 
     fun stopMonitoring() {
         audioManager.unregisterAudioPlaybackCallback(playbackCallback)
         releaseAudioPolicy()
-        Log.d(TAG, "Stopped monitoring audio playback")
     }
 
     private fun grantRoutingPermissionViaRoot() {
@@ -67,12 +62,12 @@ class AudioRoutingManager(private val context: Context) {
 
     fun applyRouting(route: AppRoute) {
         Log.d(TAG, "Applying routing: ${route.appName} -> ${route.deviceName}")
-        val policySuccess = tryAudioPolicyRouting(route)
+        val policySuccess = tryAudioPolicyViaReflection(route)
         if (policySuccess) return
         tryRootUidRouting(route)
     }
 
-    private fun tryAudioPolicyRouting(route: AppRoute): Boolean {
+    private fun tryAudioPolicyViaReflection(route: AppRoute): Boolean {
         return try {
             releaseAudioPolicy()
             val uid = getUidForPackage(route.packageName) ?: return false
@@ -81,9 +76,21 @@ class AudioRoutingManager(private val context: Context) {
                     BluetoothDeviceManager.getPhoneSpeakerDeviceInfo(audioManager)
                 else return false
 
-            val mixingRule = AudioMixingRule.Builder()
-                .addMixRule(AudioMixingRule.RULE_MATCH_UID, uid)
-                .build()
+            val audioMixingRuleClass = Class.forName("android.media.audiopolicy.AudioMixingRule")
+            val audioMixingRuleBuilderClass = Class.forName("android.media.audiopolicy.AudioMixingRule\$Builder")
+            val audioMixClass = Class.forName("android.media.audiopolicy.AudioMix")
+            val audioMixBuilderClass = Class.forName("android.media.audiopolicy.AudioMix\$Builder")
+            val audioPolicyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
+            val audioPolicyBuilderClass = Class.forName("android.media.audiopolicy.AudioPolicy\$Builder")
+
+            val ruleMatchUid = audioMixingRuleClass.getField("RULE_MATCH_UID").getInt(null)
+            val routeFlagRender = audioMixClass.getField("ROUTE_FLAG_RENDER").getInt(null)
+
+            val mixingRuleBuilder = audioMixingRuleBuilderClass.newInstance()
+            audioMixingRuleBuilderClass
+                .getMethod("addMixRule", Int::class.java, Any::class.java)
+                .invoke(mixingRuleBuilder, ruleMatchUid, uid)
+            val mixingRule = audioMixingRuleBuilderClass.getMethod("build").invoke(mixingRuleBuilder)
 
             val audioFormat = AudioFormat.Builder()
                 .setSampleRate(48000)
@@ -91,34 +98,40 @@ class AudioRoutingManager(private val context: Context) {
                 .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                 .build()
 
-            val audioMix = AudioMix.Builder(mixingRule)
-                .setFormat(audioFormat)
-                .setRouteFlags(AudioMix.ROUTE_FLAG_RENDER)
-                .build()
+            val audioMixBuilder = audioMixBuilderClass
+                .getConstructor(audioMixingRuleClass)
+                .newInstance(mixingRule)
+            audioMixBuilderClass.getMethod("setFormat", AudioFormat::class.java).invoke(audioMixBuilder, audioFormat)
+            audioMixBuilderClass.getMethod("setRouteFlags", Int::class.java).invoke(audioMixBuilder, routeFlagRender)
+            val audioMix = audioMixBuilderClass.getMethod("build").invoke(audioMixBuilder)
 
-            val policy = AudioPolicy.Builder(context)
-                .addMix(audioMix)
-                .build()
+            val policyBuilder = audioPolicyBuilderClass.getConstructor(Context::class.java).newInstance(context)
+            audioPolicyBuilderClass.getMethod("addMix", audioMixClass).invoke(policyBuilder, audioMix)
+            val policy = audioPolicyBuilderClass.getMethod("build").invoke(policyBuilder)
 
-            val result = audioManager.registerAudioPolicy(policy)
-            if (result == AudioManager.SUCCESS) {
-                policy.setPreferredDeviceForRule(
-                    AudioMixingRule.Builder()
-                        .addMixRule(AudioMixingRule.RULE_MATCH_UID, uid)
-                        .build(),
-                    targetDevice
-                )
+            val result = AudioManager::class.java
+                .getMethod("registerAudioPolicy", audioPolicyClass)
+                .invoke(audioManager, policy) as Int
+
+            if (result == 0) {
+                try {
+                    audioPolicyClass
+                        .getMethod("setPreferredDeviceForRule", audioMixingRuleClass, android.media.AudioDeviceInfo::class.java)
+                        .invoke(policy, mixingRule, targetDevice)
+                } catch (e: Exception) {
+                    Log.w(TAG, "setPreferredDeviceForRule unavailable: ${e.message}")
+                }
                 activeAudioPolicy = policy
                 true
             } else {
-                Log.w(TAG, "registerAudioPolicy failed: $result")
+                Log.w(TAG, "registerAudioPolicy returned: $result")
                 false
             }
         } catch (e: SecurityException) {
-            Log.w(TAG, "Needs MODIFY_AUDIO_ROUTING: ${e.message}")
+            Log.w(TAG, "MODIFY_AUDIO_ROUTING not granted yet: ${e.message}")
             false
         } catch (e: Exception) {
-            Log.e(TAG, "AudioPolicy error", e)
+            Log.e(TAG, "Reflection failed: ${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }
@@ -141,8 +154,15 @@ class AudioRoutingManager(private val context: Context) {
     }
 
     private fun releaseAudioPolicy() {
-        activeAudioPolicy?.let {
-            try { audioManager.unregisterAudioPolicy(it) } catch (e: Exception) { }
+        activeAudioPolicy?.let { policy ->
+            try {
+                val audioPolicyClass = Class.forName("android.media.audiopolicy.AudioPolicy")
+                AudioManager::class.java
+                    .getMethod("unregisterAudioPolicy", audioPolicyClass)
+                    .invoke(audioManager, policy)
+            } catch (e: Exception) {
+                Log.w(TAG, "unregisterAudioPolicy failed: ${e.message}")
+            }
             activeAudioPolicy = null
         }
     }
