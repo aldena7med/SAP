@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark mode (Samsung One UI Dark) -->
+    <color name="background_primary">#1C1C1E</color>
+    <color name="background_secondary">#2C2C2E</color>
+    <color name="icon_bg">#1A2E4A</color>
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#ABABAB</color>
+    <color name="text_hint">#777777</color>
+    <color name="divider">#3A3A3C</color>
+    <color name="switch_track_off">#555555</color>
+    <color name="samsung_blue_light">#1A2E4A</color>
+</resources>
