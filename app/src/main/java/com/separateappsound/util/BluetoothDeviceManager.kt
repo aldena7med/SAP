@@ -40,28 +40,27 @@ class BluetoothDeviceManager(private val context: Context) {
                     .filter {
                         it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
                         it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                        it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                        it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_BROADCAST
                     }
                     .map { it.address.lowercase() }
                     .toSet()
 
                 for (device in bondedDevices) {
-                    val isAudioDevice = device.bluetoothClass
-                        ?.hasService(android.bluetooth.BluetoothClass.Service.AUDIO) == true
-
-                    if (isAudioDevice) {
-                        val isConnected = connectedBtAddresses.any {
-                            it == device.address.lowercase()
-                        }
-                        devices.add(
-                            AudioDevice(
-                                address = device.address,
-                                name = device.name ?: "Unknown Device",
-                                type = inferDeviceType(device),
-                                isConnected = isConnected
-                            )
-                        )
+                    // Include ALL paired devices - don't filter by Bluetooth class
+                    // Some speakers (e.g. LG) don't advertise AUDIO service class correctly
+                    val isConnected = connectedBtAddresses.any {
+                        it == device.address.lowercase()
                     }
+                    devices.add(
+                        AudioDevice(
+                            address = device.address,
+                            name = device.name ?: "Unknown Device",
+                            type = inferDeviceType(device),
+                            isConnected = isConnected
+                        )
+                    )
                 }
             } catch (e: SecurityException) {
                 // Bluetooth permission not granted yet
