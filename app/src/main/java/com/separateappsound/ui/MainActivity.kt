@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
         setupServiceSwitch()
         checkPermissions()
         updateServiceStatus()
+        checkRootAccess()
     }
 
     override fun onResume() {
@@ -223,6 +224,20 @@ class MainActivity : AppCompatActivity() {
             }
             else -> super.onOptionsItemSelected(item)
         }
+    }
+
+    private fun checkRootAccess() {
+        val routingManager = com.separateappsound.util.AudioRoutingManager(this)
+        Thread {
+            val hasRoot = routingManager.hasRootAccess()
+            runOnUiThread {
+                if (hasRoot) {
+                    binding.tvServiceStatus.text = "Sound routing is OFF  ✓ Root detected"
+                } else {
+                    showSnackbar("Root not detected — routing may be limited")
+                }
+            }
+        }.start()
     }
 
     private fun showHelpDialog() {
